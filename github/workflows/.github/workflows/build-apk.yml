@@ -1,0 +1,142 @@
+name: Deploy PWA and build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  PACKAGE_ID: com.stocknote.app          # change if you want a different Android package name
+  APP_NAME: Stock Movement Note
+  LAUNCHER_NAME: Stock Note
+  KEY_ALIAS: stocknote
+
+jobs:
+  deploy-pwa:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+
+      - name: Restore signing key and build Digital Asset Links file
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          set -e
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/stocknote.keystore"
+          FP=$(keytool -list -v -keystore "$RUNNER_TEMP/stocknote.keystore" -alias "$KEY_ALIAS" \
+                -storepass "$KEYSTORE_PASSWORD" | grep 'SHA256:' | head -1 | awk '{print $2}')
+          echo "SHA256 fingerprint: $FP"
+          mkdir -p site/.well-known site/icons
+          cp index.html manifest.json sw.js site/
+          cp icons/*.png site/icons/
+          cat > site/.well-known/assetlinks.json <<JSON
+          [{
+            "relation": ["delegate_permission/common.handle_all_urls"],
+            "target": {
+              "namespace": "android_app",
+              "package_name": "$PACKAGE_ID",
+              "sha256_cert_fingerprints": ["$FP"]
+            }
+          }]
+          JSON
+          touch site/.nojekyll
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: site }
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  build-apk:
+    needs: deploy-pwa
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+
+      - name: Install Bubblewrap and point it at the runner's SDK/JDK
+        run: |
+          npm install -g @bubblewrap/cli
+          mkdir -p ~/.bubblewrap
+          echo "{\"jdkPath\":\"$JAVA_HOME\",\"androidSdkPath\":\"$ANDROID_HOME\"}" > ~/.bubblewrap/config.json
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+
+      - name: Wait for the site to be live
+        run: |
+          HOST="${GITHUB_REPOSITORY_OWNER,,}.github.io"
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "https://$HOST/manifest.json" || true)
+            [ "$code" = "200" ] && break
+            echo "waiting ($code)…"; sleep 10
+          done
+
+      - name: Generate twa-manifest.json
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          HOST="${GITHUB_REPOSITORY_OWNER,,}.github.io"
+          echo "$KEYSTORE_B64" | base64 -d > stocknote.keystore
+          cat > twa-manifest.json <<JSON
+          {
+            "packageId": "$PACKAGE_ID",
+            "host": "$HOST",
+            "name": "$APP_NAME",
+            "launcherName": "$LAUNCHER_NAME",
+            "display": "standalone",
+            "orientation": "portrait",
+            "themeColor": "#241f18",
+            "themeColorDark": "#241f18",
+            "navigationColor": "#241f18",
+            "navigationColorDark": "#241f18",
+            "backgroundColor": "#efe7d6",
+            "startUrl": "/",
+            "iconUrl": "https://$HOST/icons/icon-512.png",
+            "maskableIconUrl": "https://$HOST/icons/icon-maskable-512.png",
+            "webManifestUrl": "https://$HOST/manifest.json",
+            "fullScopeUrl": "https://$HOST/",
+            "appVersion": "${{ github.run_number }}",
+            "appVersionName": "1.0.${{ github.run_number }}",
+            "enableNotifications": false,
+            "enableSiteSettingsShortcut": false,
+            "isChromeOSOnly": false,
+            "minSdkVersion": 21,
+            "splashScreenFadeOutDuration": 300,
+            "fallbackType": "customtabs",
+            "signingKey": { "path": "./stocknote.keystore", "alias": "$KEY_ALIAS" },
+            "features": {},
+            "shortcuts": [],
+            "generatorApp": "bubblewrap-cli"
+          }
+          JSON
+
+      - name: Build signed APK
+        env:
+          BUBBLEWRAP_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          BUBBLEWRAP_KEY_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: bubblewrap build --skipPwaValidation --skipSigning=false
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StockNote-apk
+          path: |
+            app-release-signed.apk
+            app-release-bundle.aab
